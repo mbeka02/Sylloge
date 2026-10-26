@@ -1,0 +1,21 @@
+services:
+  app:
+    profiles: [dev]
+    build:
+      context: .
+      target: development
+    environment:
+      # '-' defaults only unset inputs; an explicit empty value reaches validation.
+      PORT: ${PORT-3000}
+      APP_ENV: ${APP_ENV-development}
+      ROUTING_CONFIG_FILE: ${ROUTING_CONFIG_FILE-configs/routing.example.json}
+      HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT-5s}
+      HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT-10s}
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT-10s}
+      HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT-60s}
+      HTTP_MAX_HEADER_BYTES: ${HTTP_MAX_HEADER_BYTES-16384}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT-60s}
+    ports:
+      - "127.0.0.1:${PORT-3000}:${PORT-3000}"
+    # Exceed the application's normal drain budget so Docker does not cut it short.
+    stop_grace_period: 70s
