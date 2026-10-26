@@ -1,0 +1,8 @@
+{
+  "default_destination": "service1",
+  "services": {
+    "claims-api": "service1",
+    "payments-api": "service2",
+    "notifications-api": "service3"
+  }
+}
