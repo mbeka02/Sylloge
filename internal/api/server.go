@@ -2,16 +2,11 @@ package api
 
 import "net/http"
 
-type Server struct {
-	addr string
-}
-
-func NewServer(addr string) (*http.Server, error) {
-	srv := &Server{
-		addr,
-	}
+// NewServer assembles the HTTP routes. Startup applies the configured timeouts
+// before serving; ingestion stays unavailable until the pipeline is connected.
+func NewServer(addr string) *http.Server {
 	return &http.Server{
-		Handler: srv.RegisterRoutes(),
-		Addr:    srv.addr,
-	}, nil
+		Handler: routes(),
+		Addr:    addr,
+	}
 }

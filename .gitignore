@@ -1,1 +1,17 @@
 .env
+.env.*
+!.env.example
+
+# Internal planning documents stay local.
+/design_spec.md
+/implementation_plan.md
+
+# Generated runtime and development artifacts.
+/bin/
+/data/
+*.db
+*.db-wal
+*.db-shm
+logs-failed*.json
+*.prof
+coverage.out
