@@ -1,14 +1,20 @@
 package api
 
 import (
-	"fmt"
+	"io"
 	"net/http"
 )
 
-func (s *Server) RegisterRoutes() http.Handler {
+func routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "logs upon logs upon logs upon logs")
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, "{\"status\":\"ok\"}\n")
+	})
+	mux.HandleFunc("POST /logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "{\"error\":\"ingestion unavailable\"}\n")
 	})
 	return mux
 }
