@@ -1,0 +1,17 @@
+.git
+.agents
+.aws
+.codex
+.env
+.env.*
+design_spec.md
+implementation_plan.md
+skills-lock.json
+bin
+data
+*.db
+*.db-wal
+*.db-shm
+logs-failed*.json
+*.prof
+coverage.out
