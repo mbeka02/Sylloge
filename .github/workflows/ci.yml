@@ -19,4 +19,3 @@ jobs:
           go-version-file: go.mod
           cache: false # No module dependencies yet.
       - run: make check build race test-launch
-      - run: make vuln

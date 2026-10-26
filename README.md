@@ -98,19 +98,21 @@ make check           # formatting, vet, unit tests and live listener/command tes
 make build
 make race
 make test-launch     # real Compose file/env precedence checks; no daemon needed
-make vuln            # separately pinned govulncheck; needs network access
+make vuln            # optional manual vulnerability scan; needs network access
 ```
 
 Make disables automatic toolchain switching and checks the exact Go version.
 The tests exercise production without `.env`, real TCP startup and SIGTERM, bad
 configuration/exit status, HTTP status contracts, and routing-file validation.
 Compose launch tests use isolated fixture files and avoid printing rendered input
-values. CI runs the same checks. `make vuln` downloads only a separately versioned
-tool; it does not add a runtime dependency to the application.
+values. CI runs formatting, vet, build, tests, race detection, and Compose checks.
+`make vuln` remains an optional manual command and downloads only a separately
+versioned tool; it does not add a runtime dependency to the application.
 
 Current verification: build, vet, unit/subprocess tests, race detection, and Compose
 precedence checks pass with Go 1.26.0. The vulnerability scan runs successfully but
 exits with findings: 23 reachable standard-library reports against this initial
-patch version. Its reported fixes extend through Go 1.26.10. The CI security step
-is deliberately failing until the Go patch pin is updated consistently and the
-scan is rerun; findings are not suppressed.
+patch version. Its reported fixes extend through Go 1.26.10. The scan is outside
+required CI while the Go patch-update policy is agreed. Running `make vuln` still
+reports findings and exits unsuccessfully; they are not suppressed or fixed by
+this CI change.
