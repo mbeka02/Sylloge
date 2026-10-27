@@ -1,20 +1,24 @@
 package api
 
 import (
-	"io"
+	"log/slog"
 	"net/http"
 )
 
+type handler struct {
+	logger *slog.Logger
+}
+
 func routes() http.Handler {
+	h := &handler{logger: slog.Default()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, "{\"status\":\"ok\"}\n")
+		h.respondWithJSON(w, http.StatusOK, struct {
+			Status string `json:"status"`
+		}{Status: "ok"})
 	})
 	mux.HandleFunc("POST /logs", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		io.WriteString(w, "{\"error\":\"ingestion unavailable\"}\n")
+		h.respondWithError(w, http.StatusServiceUnavailable, "ingestion unavailable")
 	})
 	return mux
 }
