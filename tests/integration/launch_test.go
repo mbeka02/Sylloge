@@ -23,7 +23,7 @@ func composeConfig(t *testing.T, path string, overrides ...string) (map[string]s
 	// Isolate application inputs without modifying the test process environment.
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
-		if key == "PORT" || key == "APP_ENV" || key == "ROUTING_CONFIG_FILE" || key == "SHUTDOWN_TIMEOUT" || strings.HasPrefix(key, "HTTP_") || strings.HasPrefix(key, "COMPOSE_") {
+		if key == "PORT" || key == "APP_ENV" || key == "ROUTING_CONFIG_FILE" || key == "SHUTDOWN_TIMEOUT" || key == "MAX_ACTIVE_REQUESTS" || key == "TRUSTED_PROXIES" || key == "RAW_LOGS_CAPACITY" || key == "INGEST_BATCH_SIZE" || key == "ADMISSION_TIMEOUT" || strings.HasPrefix(key, "RATE_LIMIT") || strings.HasPrefix(key, "HTTP_") || strings.HasPrefix(key, "COMPOSE_") {
 			continue
 		}
 		cmd.Env = append(cmd.Env, item)
@@ -44,28 +44,30 @@ func composeConfig(t *testing.T, path string, overrides ...string) (map[string]s
 
 func TestDevelopmentEnvironmentPrecedence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
-	if err := os.WriteFile(path, []byte("PORT=8080\nAPP_ENV=development\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("PORT=8080\nAPP_ENV=development\nRATE_LIMIT=5\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name              string
-		overrides         []string
-		port, environment string
+		name                    string
+		overrides               []string
+		port, environment, rate string
+		invalid                 bool
 	}{
-		{"file", nil, "8080", "development"},
-		{"injected", []string{"PORT=8081", "APP_ENV=staging"}, "8081", "staging"},
-		{"explicitly empty", []string{"APP_ENV="}, "8080", ""},
+		{"file", nil, "8080", "development", "5", false},
+		{"injected", []string{"PORT=8081", "APP_ENV=staging", "RATE_LIMIT=7"}, "8081", "staging", "7", false},
+		{"explicitly empty", []string{"APP_ENV="}, "8080", "", "5", true},
+		{"explicitly empty rate", []string{"RATE_LIMIT="}, "8080", "development", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			values, err := composeConfig(t, path, tc.overrides...)
 			if err != nil {
 				t.Fatalf("Compose launch configuration failed: %v", err)
 			}
-			if values["PORT"] != tc.port || values["APP_ENV"] != tc.environment {
+			if values["PORT"] != tc.port || values["APP_ENV"] != tc.environment || values["RATE_LIMIT"] != tc.rate {
 				t.Fatal("development input precedence was not preserved")
 			}
 			_, err = config.Load(func(key string) (string, bool) { value, ok := values[key]; return value, ok })
-			if (err != nil) != (tc.environment == "") {
+			if (err != nil) != tc.invalid {
 				t.Fatal("unexpected application validation result")
 			}
 		})

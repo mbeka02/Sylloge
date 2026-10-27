@@ -10,7 +10,10 @@ import (
 )
 
 func TestStartupRoutes(t *testing.T) {
-	server := api.NewServer(":3000")
+	server, err := api.NewServer(":3000", api.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		method, path string
 		status       int

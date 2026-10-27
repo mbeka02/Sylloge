@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
+
+	"github.com/mbeka02/sylloge/internal/event"
+	"github.com/mbeka02/sylloge/internal/routing"
 )
 
 type Routing struct {
-	DefaultDestination string            `json:"default_destination"`
-	Services           map[string]string `json:"services"`
+	DefaultDestination event.Destination            `json:"default_destination"`
+	Services           map[string]event.Destination `json:"services"`
 }
 
 // LoadRouting validates configuration only; routing events belongs to the pipeline.
@@ -30,17 +32,8 @@ func LoadRouting(path string) (Routing, error) {
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return Routing{}, errors.New("ROUTING_CONFIG_FILE must contain exactly one JSON object")
 	}
-	if !validDestination(rules.DefaultDestination) {
-		return Routing{}, errors.New("ROUTING_CONFIG_FILE default_destination must be service1, service2, or service3")
-	}
-	for service, destination := range rules.Services {
-		if strings.TrimSpace(service) == "" || len([]rune(service)) > 100 || !validDestination(destination) {
-			return Routing{}, errors.New("ROUTING_CONFIG_FILE contains an invalid service mapping")
-		}
+	if _, err := routing.New(rules.DefaultDestination, rules.Services); err != nil {
+		return Routing{}, fmt.Errorf("ROUTING_CONFIG_FILE: %w", err)
 	}
 	return rules, nil
-}
-
-func validDestination(value string) bool {
-	return value == "service1" || value == "service2" || value == "service3"
 }
