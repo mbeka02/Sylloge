@@ -23,7 +23,14 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if _, err := config.LoadRouting(cfg.RoutingConfigFile); err != nil {
 		return err
 	}
-	server := api.NewServer(net.JoinHostPort("", strconv.Itoa(cfg.HTTP.Port)))
+	server, err := api.NewServer(net.JoinHostPort("", strconv.Itoa(cfg.HTTP.Port)), api.Options{
+		Logger: logger, Environment: cfg.Environment, TrustedProxies: cfg.HTTP.TrustedProxies,
+		MaxActiveRequests: cfg.HTTP.MaxActiveRequests, RateLimit: cfg.HTTP.RateLimit,
+		MaxIPEntries: cfg.HTTP.MaxIPEntries, IPIdleTimeout: cfg.HTTP.IPIdleTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("configure HTTP server: %w", err)
+	}
 	server.ReadHeaderTimeout = cfg.HTTP.ReadHeaderTimeout
 	server.ReadTimeout = cfg.HTTP.ReadTimeout
 	server.WriteTimeout = cfg.HTTP.WriteTimeout
