@@ -18,6 +18,7 @@ type Admitter interface {
 
 type Options struct {
 	Admitter          Admitter
+	Ready             func() bool
 	Metrics           *metrics.Registry
 	Logger            *slog.Logger
 	Environment       string
@@ -93,8 +94,18 @@ func routes(h *handler) http.Handler {
 		}{Status: "ok"})
 	})
 	mux.HandleFunc("POST /logs", h.logs)
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if h.options.Ready == nil || !h.options.Ready() {
+			h.respondWithError(w, http.StatusServiceUnavailable, "not ready")
+			return
+		}
+		h.respondWithJSON(w, http.StatusOK, struct {
+			Status string `json:"status"`
+		}{Status: "ready"})
+	})
 	mux.HandleFunc("/logs", h.methodNotAllowed("POST"))
 	mux.HandleFunc("/healthz", h.methodNotAllowed("GET, HEAD"))
+	mux.HandleFunc("/readyz", h.methodNotAllowed("GET, HEAD"))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { h.respondWithError(w, http.StatusNotFound, "not found") })
 	return mux
 }

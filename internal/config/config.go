@@ -26,14 +26,18 @@ type HTTP struct {
 
 type Pipeline struct {
 	Capacity         int
+	DeliveryCapacity int
 	BatchSize        int
 	AdmissionTimeout time.Duration
 }
+
+type Storage struct{ DataDir string }
 
 type Config struct {
 	Environment       string
 	HTTP              HTTP
 	Pipeline          Pipeline
+	Storage           Storage
 	RoutingConfigFile string
 	ShutdownTimeout   time.Duration
 }
@@ -49,7 +53,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384, MaxActiveRequests: 128,
 			RateLimit: 1000, MaxIPEntries: 10000, IPIdleTimeout: 60 * time.Second,
 		},
-		Pipeline:          Pipeline{Capacity: 10000, BatchSize: 50, AdmissionTimeout: 100 * time.Millisecond},
+		Pipeline:          Pipeline{Capacity: 10000, DeliveryCapacity: 1000, BatchSize: 50, AdmissionTimeout: 100 * time.Millisecond},
+		Storage:           Storage{DataDir: "data"},
 		RoutingConfigFile: "configs/routing.example.json",
 		ShutdownTimeout:   60 * time.Second,
 	}
@@ -59,6 +64,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}{
 		{"APP_ENV", &cfg.Environment},
 		{"ROUTING_CONFIG_FILE", &cfg.RoutingConfigFile},
+		{"DATA_DIR", &cfg.Storage.DataDir},
 	} {
 		if value, ok := lookup(setting.key); ok {
 			if strings.TrimSpace(value) == "" {
@@ -76,6 +82,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		{"HTTP_MAX_HEADER_BYTES", &cfg.HTTP.MaxHeaderBytes, 1 << 20},
 		{"MAX_ACTIVE_REQUESTS", &cfg.HTTP.MaxActiveRequests, int(^uint(0) >> 1)},
 		{"RAW_LOGS_CAPACITY", &cfg.Pipeline.Capacity, int(^uint(0) >> 1)},
+		{"MEMORY_QUEUE_CAPACITY", &cfg.Pipeline.DeliveryCapacity, int(^uint(0) >> 1)},
 		{"INGEST_BATCH_SIZE", &cfg.Pipeline.BatchSize, int(^uint(0) >> 1)},
 		{"RATE_LIMIT", &cfg.HTTP.RateLimit, int(^uint(0) >> 1)},
 		{"RATE_LIMIT_MAX_IPS", &cfg.HTTP.MaxIPEntries, int(^uint(0) >> 1)},
