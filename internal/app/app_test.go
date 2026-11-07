@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,11 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mbeka02/sylloge/internal/app"
 	"github.com/mbeka02/sylloge/internal/config"
+	_ "modernc.org/sqlite"
 )
 
 type startupLog struct{ address chan string }
@@ -46,6 +50,7 @@ func TestRunServesConfiguredPortAndStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.RoutingConfigFile = filepath.Join(t.TempDir(), "routing.json")
+	cfg.Storage.DataDir = t.TempDir()
 	if err := os.WriteFile(cfg.RoutingConfigFile, []byte(`{"default_destination":"service1","services":{}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -175,8 +180,259 @@ func startupConfig(t *testing.T) config.Config {
 		t.Fatal(err)
 	}
 	cfg.RoutingConfigFile = filepath.Join(t.TempDir(), "routing.json")
+	cfg.Storage.DataDir = t.TempDir()
 	if err := os.WriteFile(cfg.RoutingConfigFile, []byte(`{"default_destination":"service1"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestHTTPToAllSQLiteDestinationsAndFinalDrain(t *testing.T) {
+	cfg := startupConfig(t)
+	cfg.HTTP.Port = 0
+	cfg.Environment = "integration"
+	if err := os.WriteFile(cfg.RoutingConfigFile, []byte(`{"default_destination":"service3","services":{"claims-api":"service1","payments-api":"service2"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	address := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx, cfg, slog.New(slog.NewJSONHandler(startupLog{address}, nil))) }()
+	var bound string
+	select {
+	case bound = <-address:
+	case err := <-done:
+		t.Fatalf("startup=%v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup timeout")
+	}
+	_, port, err := net.SplitHostPort(bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://127.0.0.1:" + port
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	response, err := client.Get(base + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatalf("readiness=%d", response.StatusCode)
+	}
+	body := `[{"timestamp":"2026-10-26T13:30:00+03:00","service":"claims-api","level":"ERROR","message":"claim"},{"timestamp":"2026-10-26T10:30:00Z","service":"payments-api","level":"INFO","message":"payment"},{"timestamp":"2026-10-26T10:30:00Z","service":"unknown-api","level":"WARN","message":"default"}]`
+	response, err = client.Post(base+"/logs", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 202 {
+		t.Fatalf("ingestion=%d", response.StatusCode)
+	}
+	// Cancel immediately: accepted partial batches must still reach all files.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain timeout")
+	}
+	for i, producer := range []string{"claims-api", "payments-api", "unknown-api"} {
+		db, err := sql.Open("sqlite", filepath.Join(cfg.Storage.DataDir, "logs_service"+strconv.Itoa(i+1)+".db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var id, timestamp, service, level, message, received, source, environment string
+		rows, err := db.Query(`SELECT id,timestamp,service,level,message,received_at,source_ip,env FROM logs`)
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if !rows.Next() {
+			rows.Close()
+			db.Close()
+			t.Fatalf("destination %d has no persisted row", i+1)
+		}
+		err = rows.Scan(&id, &timestamp, &service, &level, &message, &received, &source, &environment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id == "" || timestamp != "2026-10-26T10:30:00Z" || service != producer || environment != "integration" || source != "127.0.0.1" || len(received) != 27 {
+			t.Fatalf("unexpected row in destination %d: %s %s %s %s %s", i+1, id, service, environment, source, received)
+		}
+		if rows.Next() {
+			t.Fatal("destination contains another producer")
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+		db.Close()
+	}
+}
+
+func runningApp(t *testing.T, cfg config.Config) (string, func() error) {
+	t.Helper()
+	cfg.HTTP.Port = 0
+	ctx, cancel := context.WithCancel(t.Context())
+	address := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx, cfg, slog.New(slog.NewJSONHandler(startupLog{address}, nil))) }()
+	var result error
+	var once sync.Once
+	stop := func() error {
+		once.Do(func() {
+			cancel()
+			select {
+			case result = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("shutdown timed out")
+			}
+		})
+		return result
+	}
+	t.Cleanup(func() { stop() })
+	select {
+	case bound := <-address:
+		_, port, err := net.SplitHostPort(bound)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "http://127.0.0.1:" + port, stop
+	case err := <-done:
+		// Keep cleanup from waiting for an already-consumed completion.
+		once.Do(func() { cancel(); result = err })
+		t.Fatalf("startup=%v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup timed out")
+	}
+	return "", stop
+}
+
+func waitFor(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out: " + description)
+}
+
+func postLog(t *testing.T, client *http.Client, base, service string, count int) int {
+	t.Helper()
+	entries := make([]string, count)
+	for i := range entries {
+		entries[i] = `{"timestamp":"2026-10-26T10:30:00Z","service":"` + service + `","level":"INFO","message":"persist me"}`
+	}
+	response, err := client.Post(base+"/logs", "application/json", strings.NewReader("["+strings.Join(entries, ",")+"]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	io.Copy(io.Discard, response.Body)
+	return response.StatusCode
+}
+
+func TestLiveHTTPPersistsLowVolumeAndFullBatches(t *testing.T) {
+	cfg := startupConfig(t)
+	base, stop := runningApp(t, cfg)
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	db, err := sql.Open("sqlite", filepath.Join(cfg.Storage.DataDir, "logs_service1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if status := postLog(t, client, base, "claims-api", 1); status != 202 {
+		t.Fatalf("low-volume status=%d", status)
+	}
+	waitFor(t, "one-second low-volume flush", func() bool { var n int; return db.QueryRow(`SELECT count(*) FROM logs`).Scan(&n) == nil && n == 1 })
+	if status := postLog(t, client, base, "claims-api", 100); status != 202 {
+		t.Fatalf("full batch status=%d", status)
+	}
+	waitFor(t, "100-record flush", func() bool { var n int; return db.QueryRow(`SELECT count(*) FROM logs`).Scan(&n) == nil && n == 101 })
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedDestinationBecomesUnreadyAndBackpressuresWithoutDiscarding(t *testing.T) {
+	cfg := startupConfig(t)
+	cfg.Pipeline.Capacity = 2
+	cfg.Pipeline.BatchSize = 1
+	cfg.Pipeline.DeliveryCapacity = 1
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	base, stop := runningApp(t, cfg)
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	db, err := sql.Open("sqlite", filepath.Join(cfg.Storage.DataDir, "logs_service1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER reject_insert BEFORE INSERT ON logs BEGIN SELECT RAISE(FAIL,'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if status := postLog(t, client, base, "claims-api", 1); status != 202 {
+		t.Fatalf("initial status=%d", status)
+	}
+	waitFor(t, "readiness after real SQLite write failure", func() bool {
+		response, err := client.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		response.Body.Close()
+		return response.StatusCode == 503
+	})
+	response, err := client.Get(base + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatal("failure changed liveness")
+	}
+	accepted := 1
+	for range 8 {
+		status := postLog(t, client, base, "claims-api", 1)
+		if status == 503 {
+			break
+		}
+		if status != 202 {
+			t.Fatalf("unexpected status=%d", status)
+		}
+		accepted++
+	}
+	if accepted != 5 {
+		t.Fatalf("bounded capacity = %d accepted, want held 1 + queued 1 + dispatch 1 + raw 2", accepted)
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT count(*) FROM logs`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("failed batch partially persisted: %d, %v", rows, err)
+	}
+	err = stop()
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "undurable memory records remain") {
+		t.Fatalf("shutdown concealed retained events: %v", err)
+	}
+}
+
+func TestUnwritableStorageFailsBeforeListening(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; non-root runtime smoke test covers this case")
+	}
+	cfg := startupConfig(t)
+	if err := os.Chmod(cfg.Storage.DataDir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(cfg.Storage.DataDir, 0700)
+	if err := app.Run(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+		t.Fatal("unwritable storage did not fail startup")
+	}
 }

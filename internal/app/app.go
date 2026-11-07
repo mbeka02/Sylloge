@@ -16,17 +16,23 @@ import (
 
 // Run serves until cancellation or a server failure. A failed graceful shutdown
 // forces connections closed and returns an error rather than reporting success.
-func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := config.LoadRouting(cfg.RoutingConfigFile); err != nil {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	engine, err := newEngine(ctx, cfg, logger)
+	if err != nil {
 		return err
 	}
+	defer func() { err = errors.Join(err, engine.closeStores()) }()
 	server, err := api.NewServer(net.JoinHostPort("", strconv.Itoa(cfg.HTTP.Port)), api.Options{
 		Logger: logger, Environment: cfg.Environment, TrustedProxies: cfg.HTTP.TrustedProxies,
 		MaxActiveRequests: cfg.HTTP.MaxActiveRequests, RateLimit: cfg.HTTP.RateLimit,
 		MaxIPEntries: cfg.HTTP.MaxIPEntries, IPIdleTimeout: cfg.HTTP.IPIdleTimeout,
+		Admitter: engine.pipeline, Metrics: engine.metrics, Ready: engine.ready.Load,
 	})
 	if err != nil {
 		return fmt.Errorf("configure HTTP server: %w", err)
@@ -41,27 +47,33 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("listen for HTTP: %w", err)
 	}
+	engine.start()
 	logger.Info("listening", "address", listener.Addr().String(), "environment", cfg.Environment)
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
+	serveConsumed := false
 	select {
-	case err := <-served:
-		return serveError(err)
+	case serveErr := <-served:
+		serveConsumed = true
+		err = serveError(serveErr)
 	case <-ctx.Done():
 	}
 	logger.Info("shutdown started")
+	engine.ready.Store(false)
 	// The signal must not cancel the independent drain window.
 	drain, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(drain); err != nil {
-		closeErr := server.Close()
-		return errors.Join(fmt.Errorf("shutdown HTTP server: %w", err), closeErr, serveError(<-served))
+	if shutdownErr := server.Shutdown(drain); shutdownErr != nil {
+		err = errors.Join(err, fmt.Errorf("shutdown HTTP server: %w", shutdownErr), server.Close())
 	}
-	if err := serveError(<-served); err != nil {
-		return err
+	if !serveConsumed {
+		err = errors.Join(err, serveError(<-served))
 	}
-	logger.Info("shutdown complete")
-	return nil
+	err = errors.Join(err, engine.drain(drain))
+	if err == nil {
+		logger.Info("shutdown complete")
+	}
+	return err
 }
 
 func serveError(err error) error {

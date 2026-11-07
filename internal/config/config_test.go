@@ -26,6 +26,27 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadStorageAndMemoryDeliverySettings(t *testing.T) {
+	cfg, err := config.Load(func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.DataDir != "data" || cfg.Pipeline.DeliveryCapacity != 1000 {
+		t.Fatal("unexpected persistence defaults")
+	}
+	values := map[string]string{"DATA_DIR": "/var/lib/sylloge", "MEMORY_QUEUE_CAPACITY": "20"}
+	cfg, err = config.Load(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+	if err != nil || cfg.Storage.DataDir != "/var/lib/sylloge" || cfg.Pipeline.DeliveryCapacity != 20 {
+		t.Fatalf("storage settings=%+v, %v", cfg, err)
+	}
+	for key, value := range map[string]string{"DATA_DIR": " ", "MEMORY_QUEUE_CAPACITY": "0"} {
+		_, err := config.Load(func(k string) (string, bool) { return value, k == key })
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Fatalf("missing %s validation", key)
+		}
+	}
+}
+
 func TestLoadTypedOverrides(t *testing.T) {
 	values := map[string]string{
 		"PORT": "8081", "APP_ENV": "staging", "ROUTING_CONFIG_FILE": "routing.json",

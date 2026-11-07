@@ -23,7 +23,14 @@ services:
       RAW_LOGS_CAPACITY: ${RAW_LOGS_CAPACITY-10000}
       INGEST_BATCH_SIZE: ${INGEST_BATCH_SIZE-50}
       ADMISSION_TIMEOUT: ${ADMISSION_TIMEOUT-100ms}
+      DATA_DIR: ${DATA_DIR-/app/data}
+      MEMORY_QUEUE_CAPACITY: ${MEMORY_QUEUE_CAPACITY-1000}
+    volumes:
+      - app-data:${DATA_DIR-/app/data}
     ports:
       - "127.0.0.1:${PORT-3000}:${PORT-3000}"
     # Exceed the application's normal drain budget so Docker does not cut it short.
     stop_grace_period: 70s
+
+volumes:
+  app-data:
