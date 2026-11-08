@@ -24,6 +24,7 @@ services:
       INGEST_BATCH_SIZE: ${INGEST_BATCH_SIZE-50}
       ADMISSION_TIMEOUT: ${ADMISSION_TIMEOUT-100ms}
       DATA_DIR: ${DATA_DIR-/app/data}
+      DEAD_LETTER_PATH: ${DEAD_LETTER_PATH-${DATA_DIR-/app/data}/logs-failed.json}
       MEMORY_QUEUE_CAPACITY: ${MEMORY_QUEUE_CAPACITY-1000}
     volumes:
       - app-data:${DATA_DIR-/app/data}

@@ -27,12 +27,12 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (err error
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, engine.closeStores()) }()
+	defer func() { err = errors.Join(err, engine.closeStorage()) }()
 	server, err := api.NewServer(net.JoinHostPort("", strconv.Itoa(cfg.HTTP.Port)), api.Options{
 		Logger: logger, Environment: cfg.Environment, TrustedProxies: cfg.HTTP.TrustedProxies,
 		MaxActiveRequests: cfg.HTTP.MaxActiveRequests, RateLimit: cfg.HTTP.RateLimit,
 		MaxIPEntries: cfg.HTTP.MaxIPEntries, IPIdleTimeout: cfg.HTTP.IPIdleTimeout,
-		Admitter: engine.pipeline, Metrics: engine.metrics, Ready: engine.ready.Load,
+		Admitter: engine.pipeline, Metrics: engine.metrics, Ready: engine.healthy,
 	})
 	if err != nil {
 		return fmt.Errorf("configure HTTP server: %w", err)

@@ -23,7 +23,7 @@ func composeConfig(t *testing.T, path string, overrides ...string) (map[string]s
 	// Isolate application inputs without modifying the test process environment.
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
-		if key == "PORT" || key == "APP_ENV" || key == "ROUTING_CONFIG_FILE" || key == "SHUTDOWN_TIMEOUT" || key == "MAX_ACTIVE_REQUESTS" || key == "TRUSTED_PROXIES" || key == "RAW_LOGS_CAPACITY" || key == "INGEST_BATCH_SIZE" || key == "ADMISSION_TIMEOUT" || key == "DATA_DIR" || key == "MEMORY_QUEUE_CAPACITY" || strings.HasPrefix(key, "RATE_LIMIT") || strings.HasPrefix(key, "HTTP_") || strings.HasPrefix(key, "COMPOSE_") {
+		if key == "PORT" || key == "APP_ENV" || key == "ROUTING_CONFIG_FILE" || key == "SHUTDOWN_TIMEOUT" || key == "MAX_ACTIVE_REQUESTS" || key == "TRUSTED_PROXIES" || key == "RAW_LOGS_CAPACITY" || key == "INGEST_BATCH_SIZE" || key == "ADMISSION_TIMEOUT" || key == "DATA_DIR" || key == "DEAD_LETTER_PATH" || key == "MEMORY_QUEUE_CAPACITY" || strings.HasPrefix(key, "RATE_LIMIT") || strings.HasPrefix(key, "HTTP_") || strings.HasPrefix(key, "COMPOSE_") {
 			continue
 		}
 		cmd.Env = append(cmd.Env, item)
@@ -69,6 +69,38 @@ func TestDevelopmentStorageEnvironmentPrecedence(t *testing.T) {
 			}
 			if !tc.invalid && (cfg.Storage.DataDir != tc.dir || cfg.Pipeline.DeliveryCapacity != tc.capacity) {
 				t.Fatal("storage precedence not preserved")
+			}
+		})
+	}
+}
+
+func TestDevelopmentDeadLetterEnvironmentPrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte("DATA_DIR=/app/custom-data\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		overrides []string
+		expected  string
+		invalid   bool
+	}{
+		{"derived", nil, "/app/custom-data/logs-failed.json", false},
+		{"new data directory", []string{"DATA_DIR=/app/other-data"}, "/app/other-data/logs-failed.json", false},
+		{"explicit", []string{"DEAD_LETTER_PATH=/app/archive/failed.json"}, "/app/archive/failed.json", false},
+		{"empty", []string{"DEAD_LETTER_PATH="}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values, err := composeConfig(t, path, tc.overrides...)
+			if err != nil {
+				t.Fatal("Compose dead-letter configuration failed")
+			}
+			cfg, err := config.Load(func(k string) (string, bool) { v, ok := values[k]; return v, ok })
+			if (err != nil) != tc.invalid {
+				t.Fatal("unexpected dead-letter validation")
+			}
+			if !tc.invalid && cfg.Storage.DeadLetterPath != tc.expected {
+				t.Fatalf("dead-letter path=%q", cfg.Storage.DeadLetterPath)
 			}
 		})
 	}

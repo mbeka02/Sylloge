@@ -3,8 +3,8 @@
 A Go log ingestion engine under construction. HTTP validation, per-IP token
 buckets, bounded admission, enrichment and configured routing now feed three
 SQLite databases through bounded memory queues. `POST /logs` accepts valid work
-asynchronously. RabbitMQ, write retries, dead-letter handling and the dashboard
-are later milestones; this is the memory-delivery milestone.
+asynchronously. Failed writes retry and then go to a synced, rotating dead-letter
+file. RabbitMQ and the dashboard remain later milestones; delivery currently uses memory.
 
 ## Requirements
 
@@ -99,6 +99,7 @@ docker run --rm --name sylloge -p 127.0.0.1:3000:3000 \
 | INGEST_BATCH_SIZE | 50 | Positive integer; drain up to this many available records |
 | ADMISSION_TIMEOUT | 100ms | Positive Go duration, at most 100ms for the whole valid subset |
 | DATA_DIR | data | Nonempty writable local directory; created if missing; Compose defaults to /app/data |
+| DEAD_LETTER_PATH | DATA_DIR/logs-failed.json | Writable JSON Lines file; custom locations need their own persistent mount |
 | MEMORY_QUEUE_CAPACITY | 1000 | Positive integer; queued deliveries per destination, excluding writer-owned batches |
 
 The application connects the bounded pipeline to three memory delivery paths
@@ -116,7 +117,7 @@ does not log its full configuration.
 | Endpoint | Current behavior |
 | --- | --- |
 | GET/HEAD /healthz | `200`, `{"status":"ok"}` for GET; process liveness only |
-| GET/HEAD /readyz | `200`, `{"status":"ready"}` when workers are healthy; `503` after worker failure or during shutdown |
+| GET/HEAD /readyz | `200`, `{"status":"ready"}` when workers are healthy; `503` during failed-write recovery, unresolved dead-letter failures, or shutdown |
 | POST /logs | `202` after bounded admission; validation, rate-limit and overload responses described below |
 | Other methods on these routes | `405` with Allow header |
 
@@ -152,18 +153,47 @@ commit, and deliveries settle afterward. Retrying an HTTP request creates new ID
 this is not HTTP-level idempotency. SQLite runtime verified: **3.54.1**.
 
 **202 acknowledges volatile admission, not disk durability.** A process or host
-crash can lose raw, queued or writer-held records. In this milestone a failed
-writer retains its unsettled batch and stops consuming; readiness returns 503.
+crash can lose raw, queued or writer-held records. A failed writer retains its
+batch and pauses that destination's intake during recovery; readiness returns 503.
 The process remains available for diagnosis. Additional ingestion can fill the
 bounded backlog, then returns `503 {"error":"ingestion overloaded"}`. A blocked
 destination can eventually backpressure all producers through the shared dispatch
 worker. Other writers continue processing work already delivered to them.
 
-There is no automatic retry, dead-letter file or recovery restart yet. Repairing
-the database does not restart a stopped writer. Inspect operational errors and
-avoid terminating a process holding undurable events; a timed-out drain reports
-the remaining risk and exits unsuccessfully. Those recovery paths belong to the
-next milestone. This mode does not establish RabbitMQ-outage recovery.
+The initial write is followed by at most three retries after **1s, 5s and 10s**,
+measured after the preceding failure. Every attempt has its own two-second
+deadline; event IDs and enrichment stay unchanged. The writer logs attempts per
+record. It resumes normal intake after a successful commit or durable terminal
+handling, and readiness recovers when all writers are healthy.
+
+After attempt four fails, the writer appends each event to `logs-failed.json` as
+**JSON Lines**, including original JSON, stable IDs, enriched event, destination,
+attempt count, last database error and UTC failure time. One shared owner serializes
+append, File.Sync and rotation. Deliveries settle only after durable handling.
+The file rotates after a complete append exceeds **10,000,000 bytes**; timestamp
+and UUID filenames preserve older archives. An incomplete startup tail is copied
+and synced to a separate `.partial` file before the active file is repaired.
+
+A dead-letter write failure retains ownership and retries once per second, without
+creating retry goroutines. Partial/unsynced writes are truncated back to their
+previous complete offset and synced. If that repair fails, subsequent calls must
+finish it before writing new bytes. Failed rotation operations are also completed
+before further appends. Readiness stays unhealthy until the affected work is
+handled; prolonged failures propagate bounded backpressure. Directory sync is
+required for dead-letter metadata durability. Regular file syscalls are synchronous;
+context cancellation interrupts retry/lock waits, but cannot forcibly interrupt a
+stuck operating-system file operation.
+
+In-process resumption preserves attempt counts and skips records already handled
+durably. Process loss can reset retry state and can duplicate dead-letter lines
+after sync but before settlement, or after an uncertain rotation result. Stable
+IDs identify those duplicates. A timed-out drain reports unsettled pending work
+and exits unsuccessfully; some unsettled deliveries may already have durable rows
+or dead-letter entries. This mode does not establish RabbitMQ-outage recovery.
+
+See [dead-letter recovery guidance](docs/recovery.md) for inspection and same-ID
+replay requirements. There is no replay command in this milestone; posting a
+dead-letter record back to `/logs` creates a new event identity.
 
 To try the connected endpoint after startup:
 
@@ -193,7 +223,11 @@ configuration/exit status, HTTP contracts, and routing-file validation. Real-fil
 tests cover all three destinations, default routing, low-volume and full batches,
 final drain, deduplication, rollback, lock cancellation and permission failures.
 Virtual-time tests establish exact writer flush/deadline behavior and ownership
-retention; a live SQLite failure verifies readiness and bounded overload.
+retention, retries, cancellation/resumption and terminal settlement. A real-time
+test runs all three SQLite writers through the complete 1s/5s/10s schedule and
+shared dead-letter file. Filesystem fault tests cover short writes, sync, truncate,
+rename, reopen and tail-preservation failures. Live HTTP tests verify readiness
+recovery, bounded overload and rejection of database/dead-letter path collisions.
 Compose launch tests use isolated fixture files and avoid printing rendered input
 values. CI runs formatting, vet, build, tests, race detection, and Compose checks.
 `make vuln` remains an optional manual command and downloads only a separately

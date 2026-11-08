@@ -51,6 +51,7 @@ func TestRunServesConfiguredPortAndStops(t *testing.T) {
 	}
 	cfg.RoutingConfigFile = filepath.Join(t.TempDir(), "routing.json")
 	cfg.Storage.DataDir = t.TempDir()
+	cfg.Storage.DeadLetterPath = filepath.Join(cfg.Storage.DataDir, "logs-failed.json")
 	if err := os.WriteFile(cfg.RoutingConfigFile, []byte(`{"default_destination":"service1","services":{}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +182,7 @@ func startupConfig(t *testing.T) config.Config {
 	}
 	cfg.RoutingConfigFile = filepath.Join(t.TempDir(), "routing.json")
 	cfg.Storage.DataDir = t.TempDir()
+	cfg.Storage.DeadLetterPath = filepath.Join(cfg.Storage.DataDir, "logs-failed.json")
 	if err := os.WriteFile(cfg.RoutingConfigFile, []byte(`{"default_destination":"service1"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -434,5 +436,105 @@ func TestUnwritableStorageFailsBeforeListening(t *testing.T) {
 	defer os.Chmod(cfg.Storage.DataDir, 0700)
 	if err := app.Run(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
 		t.Fatal("unwritable storage did not fail startup")
+	}
+}
+
+func TestReadinessRecoversAfterSuccessfulDatabaseRetry(t *testing.T) {
+	cfg := startupConfig(t)
+	base, stop := runningApp(t, cfg)
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	db, err := sql.Open("sqlite", filepath.Join(cfg.Storage.DataDir, "logs_service1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER reject_insert BEFORE INSERT ON logs BEGIN SELECT RAISE(FAIL,'temporary write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if status := postLog(t, client, base, "claims-api", 1); status != 202 {
+		t.Fatalf("status=%d", status)
+	}
+	waitFor(t, "unhealthy retrying writer", func() bool {
+		response, err := client.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		response.Body.Close()
+		return response.StatusCode == 503
+	})
+	if _, err := db.Exec(`DROP TRIGGER reject_insert`); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "recovered writer readiness", func() bool {
+		response, err := client.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		response.Body.Close()
+		return response.StatusCode == 200
+	})
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM logs`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("recovered rows=%d, %v", count, err)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cfg.Storage.DeadLetterPath)
+	if err != nil || len(data) != 0 {
+		t.Fatal("recovered record was incorrectly dead-lettered")
+	}
+}
+
+func TestInvalidDeadLetterPathFailsBeforeListening(t *testing.T) {
+	cfg := startupConfig(t)
+	cfg.Storage.DeadLetterPath = t.TempDir()
+	if err := app.Run(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+		t.Fatal("directory accepted as a dead-letter file")
+	}
+}
+
+func TestDeadLetterPathCannotOverwriteSQLiteDatabase(t *testing.T) {
+	cfg := startupConfig(t)
+	base, stop := runningApp(t, cfg)
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	if status := postLog(t, client, base, "claims-api", 1); status != 202 {
+		t.Fatal(status)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(cfg.Storage.DataDir, "logs_service1.db")
+	paths := map[string]string{"database": databasePath, "WAL": databasePath + "-wal", "shared memory": databasePath + "-shm"}
+	for name, link := range map[string]func(string, string) error{"symlink": os.Symlink, "hard link": os.Link} {
+		path := filepath.Join(t.TempDir(), "linked.json")
+		if err := link(databasePath, path); err != nil {
+			t.Fatal(err)
+		}
+		paths[name] = path
+	}
+	for name, path := range paths {
+		t.Run(name, func(t *testing.T) {
+			configured := cfg
+			configured.Storage.DeadLetterPath = path
+			configured.HTTP.Port = 0
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if err := app.Run(ctx, configured, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil || !strings.Contains(err.Error(), "DEAD_LETTER_PATH") {
+				t.Fatalf("database collision should fail startup clearly: %v", err)
+			}
+		})
+	}
+
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM logs`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("dead-letter initialization damaged SQLite: count=%d, %v", count, err)
 	}
 }
