@@ -24,9 +24,16 @@ type BatchStore interface {
 	Commit(context.Context, []event.Envelope) (CommitResult, error)
 }
 
+// DeadLetterSink returns nil only after durable terminal handling. Failure
+// leaves custody with the writer and must be safe to retry with the same record.
+type DeadLetterSink interface {
+	Append(context.Context, FailedRecord) error
+}
+
 type WriterOptions struct {
-	Metrics *metrics.Registry
-	Logger  *slog.Logger
+	Metrics     *metrics.Registry
+	Logger      *slog.Logger
+	DeadLetters DeadLetterSink
 }
 
 type Writer struct {
@@ -35,7 +42,20 @@ type Writer struct {
 	options     WriterOptions
 	running     atomic.Bool
 	count       atomic.Int64
-	pending     []*queue.Delivery // owned by Run; retained on any failure
+	unhealthy   atomic.Bool
+	pending     []*pendingRecord // owned by Run; retained on cancellation
+}
+
+type pendingRecord struct {
+	delivery              *queue.Delivery
+	attempts              int
+	nextAttempt           time.Time
+	lastError             error
+	handled               bool
+	failedAt              time.Time
+	retrying              bool
+	deadlettering         bool
+	nextDeadLetterAttempt time.Time
 }
 
 func NewWriter(destination event.Destination, store BatchStore, options WriterOptions) (*Writer, error) {
@@ -52,10 +72,11 @@ func NewWriter(destination event.Destination, store BatchStore, options WriterOp
 }
 
 func (w *Writer) Pending() int64 { return w.count.Load() }
+func (w *Writer) Healthy() bool  { return !w.unhealthy.Load() }
 
 // Run owns one destination. Close the input to drain and flush its final batch.
-// Cancellation or failure leaves records owned and unsettled; a later Run may
-// resume. This milestone deliberately does not retry or dead-letter failures.
+// Cancellation leaves records owned and unsettled; a later Run resumes their
+// attempt counts and remaining delays. No retry goroutines are created.
 func (w *Writer) Run(ctx context.Context, deliveries <-chan *queue.Delivery) error {
 	if deliveries == nil {
 		return errors.New("writer requires a delivery stream")
@@ -100,7 +121,7 @@ func (w *Writer) Run(ctx context.Context, deliveries <-chan *queue.Delivery) err
 			if !ok {
 				return w.flush(ctx)
 			}
-			w.pending = append(w.pending, delivery)
+			w.pending = append(w.pending, &pendingRecord{delivery: delivery})
 			w.count.Add(1)
 			if delivery.Envelope.Destination != w.destination {
 				return errors.New("delivery destination does not match writer")
@@ -129,34 +150,150 @@ func (w *Writer) flush(ctx context.Context) error {
 	if len(w.pending) == 0 {
 		return nil
 	}
-	records := make([]event.Envelope, len(w.pending))
-	for i, delivery := range w.pending {
-		records[i] = delivery.Envelope
-	}
-	attempt, cancel := context.WithTimeout(ctx, WriteTimeout)
-	result, err := w.store.Commit(attempt, records)
-	cancel()
-	if err != nil {
-		w.options.Metrics.Add(metrics.WriteFailures, 1)
-		var coded interface{ Code() int }
-		var code int
-		if errors.As(err, &coded) {
-			code = coded.Code()
+	var unhandled []*pendingRecord
+	for _, record := range w.pending {
+		if !record.handled {
+			unhandled = append(unhandled, record)
 		}
-		for _, record := range records {
-			w.options.Logger.Error("database write failed; delivery retained", "destination", w.destination, "event_id", record.ID, "batch_id", record.BatchID, "attempt", 1, "sqlite_code", code, "error", err)
-		}
-		return fmt.Errorf("write %s batch: %w", w.destination, err)
 	}
-	w.options.Metrics.Add(metrics.Committed, result.Inserted)
-	w.options.Metrics.Add(metrics.Duplicates, result.Duplicates)
+	if len(unhandled) > 0 && unhandled[0].attempts < 4 {
+		if err := w.writeBatch(ctx, unhandled); err != nil {
+			return err
+		}
+	}
+	for _, record := range unhandled {
+		if record.handled {
+			continue
+		}
+		if w.options.DeadLetters == nil {
+			return fmt.Errorf("write %s exhausted; no dead-letter sink configured: %w", w.destination, record.lastError)
+		}
+		envelope := record.delivery.Envelope
+		failed := FailedRecord{ID: envelope.ID, BatchID: envelope.BatchID, Original: envelope.Original, Event: envelope, Destination: envelope.Destination, Attempts: record.attempts, LastError: record.lastError.Error(), FailedAt: record.failedAt}
+		for {
+			if err := waitUntil(ctx, record.nextDeadLetterAttempt); err != nil {
+				return err
+			}
+			if err := w.options.DeadLetters.Append(ctx, failed); err != nil {
+				w.unhealthy.Store(true)
+				w.options.Metrics.Add(metrics.DeadLetterFailures, 1)
+				w.options.Logger.Error("dead-letter persistence failed; delivery retained", "destination", w.destination, "event_id", envelope.ID, "batch_id", envelope.BatchID, "attempt", record.attempts, "error", err)
+				record.nextDeadLetterAttempt = time.Now().Add(time.Second)
+				continue
+			}
+			record.handled = true
+			w.options.Metrics.Add(metrics.DeadLettered, 1)
+			w.options.Logger.Warn("record dead-lettered", "destination", w.destination, "event_id", envelope.ID, "batch_id", envelope.BatchID, "attempts", record.attempts)
+			w.clearFailureGauges(record)
+			break
+		}
+	}
 	for len(w.pending) > 0 {
-		if err := w.pending[0].Settle(ctx); err != nil {
+		if err := w.pending[0].delivery.Settle(ctx); err != nil {
 			return fmt.Errorf("settle %s delivery: %w", w.destination, err)
 		}
 		w.pending[0] = nil
 		w.pending = w.pending[1:]
 		w.count.Add(-1)
 	}
+	w.unhealthy.Store(false)
 	return nil
+}
+
+func (w *Writer) writeBatch(ctx context.Context, pending []*pendingRecord) error {
+	records := make([]event.Envelope, len(pending))
+	for i, record := range pending {
+		records[i] = record.delivery.Envelope
+	}
+	delays := []time.Duration{time.Second, 5 * time.Second, 10 * time.Second}
+	for pending[0].attempts < 4 {
+		if err := waitUntil(ctx, pending[0].nextAttempt); err != nil {
+			return err
+		}
+		if pending[0].attempts > 0 {
+			w.options.Metrics.Add(metrics.Retries, uint64(len(pending)))
+		}
+		for _, record := range pending {
+			record.attempts++
+		}
+		attempt, cancel := context.WithTimeout(ctx, WriteTimeout)
+		result, err := w.store.Commit(attempt, records)
+		cancel()
+		if err == nil {
+			w.options.Metrics.Add(metrics.Committed, result.Inserted)
+			w.options.Metrics.Add(metrics.Duplicates, result.Duplicates)
+			for _, record := range pending {
+				record.handled = true
+				w.clearFailureGauges(record)
+				if record.attempts > 1 {
+					envelope := record.delivery.Envelope
+					w.options.Logger.Info("database write recovered", "destination", w.destination, "event_id", envelope.ID, "batch_id", envelope.BatchID, "attempt", record.attempts)
+				}
+			}
+			return nil
+		}
+		w.unhealthy.Store(true)
+		w.options.Metrics.Add(metrics.WriteFailures, 1)
+		var coded interface{ Code() int }
+		var code int
+		if errors.As(err, &coded) {
+			code = coded.Code()
+		}
+		next := time.Now()
+		for _, record := range pending {
+			record.lastError = err
+			if record.attempts < 4 {
+				record.nextAttempt = next.Add(delays[record.attempts-1])
+				if !record.retrying {
+					record.retrying = true
+					w.options.Metrics.AddGauge(metrics.RetryPending, 1)
+				}
+			} else {
+				if record.retrying {
+					record.retrying = false
+					w.options.Metrics.AddGauge(metrics.RetryPending, -1)
+				}
+				if !record.deadlettering {
+					record.deadlettering = true
+					w.options.Metrics.AddGauge(metrics.DeadLetterPending, 1)
+				}
+				record.failedAt = next.UTC()
+			}
+			envelope := record.delivery.Envelope
+			w.options.Logger.Error("database write failed; delivery retained", "destination", w.destination, "event_id", envelope.ID, "batch_id", envelope.BatchID, "attempt", record.attempts, "sqlite_code", code, "error", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Writer) clearFailureGauges(record *pendingRecord) {
+	if record.retrying {
+		record.retrying = false
+		w.options.Metrics.AddGauge(metrics.RetryPending, -1)
+	}
+	if record.deadlettering {
+		record.deadlettering = false
+		w.options.Metrics.AddGauge(metrics.DeadLetterPending, -1)
+	}
+}
+
+func waitUntil(ctx context.Context, deadline time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
