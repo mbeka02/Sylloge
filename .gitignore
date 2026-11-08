@@ -13,5 +13,6 @@
 *.db-wal
 *.db-shm
 logs-failed*.json
+logs-failed*.partial
 *.prof
 coverage.out
