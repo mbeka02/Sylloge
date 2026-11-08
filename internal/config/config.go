@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +32,7 @@ type Pipeline struct {
 	AdmissionTimeout time.Duration
 }
 
-type Storage struct{ DataDir string }
+type Storage struct{ DataDir, DeadLetterPath string }
 
 type Config struct {
 	Environment       string
@@ -129,6 +130,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			}
 			cfg.HTTP.TrustedProxies = append(cfg.HTTP.TrustedProxies, prefix.Masked())
 		}
+	}
+	if value, ok := lookup("DEAD_LETTER_PATH"); ok {
+		if strings.TrimSpace(value) == "" {
+			return Config{}, fmt.Errorf("DEAD_LETTER_PATH must not be empty")
+		}
+		cfg.Storage.DeadLetterPath = value
+	} else {
+		cfg.Storage.DeadLetterPath = filepath.Join(cfg.Storage.DataDir, "logs-failed.json")
 	}
 	return cfg, nil
 }

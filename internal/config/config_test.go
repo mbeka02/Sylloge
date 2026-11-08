@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,30 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.RoutingConfigFile != "configs/routing.example.json" {
 		t.Fatalf("unexpected routing file: %q", cfg.RoutingConfigFile)
+	}
+}
+
+func TestDeadLetterPathDefaultsUnderDataDirectoryAndAllowsOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		values   map[string]string
+		expected string
+		invalid  bool
+	}{
+		{"default", nil, filepath.Join("data", "logs-failed.json"), false},
+		{"data override", map[string]string{"DATA_DIR": "/var/lib/sylloge"}, "/var/lib/sylloge/logs-failed.json", false},
+		{"explicit path", map[string]string{"DEAD_LETTER_PATH": "/archive/failed.json"}, "/archive/failed.json", false},
+		{"empty path", map[string]string{"DEAD_LETTER_PATH": ""}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := config.Load(func(key string) (string, bool) { v, ok := tc.values[key]; return v, ok })
+			if (err != nil) != tc.invalid {
+				t.Fatalf("configuration=%v", err)
+			}
+			if !tc.invalid && cfg.Storage.DeadLetterPath != tc.expected {
+				t.Fatalf("path=%q", cfg.Storage.DeadLetterPath)
+			}
+		})
 	}
 }
 

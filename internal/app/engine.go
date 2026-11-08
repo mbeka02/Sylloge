@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -24,6 +26,7 @@ type engine struct {
 	pipeline    *ingest.Pipeline
 	deliveries  *queue.Memory
 	stores      []*storage.SQLite
+	deadLetters *storage.DeadLetter
 	writers     []*storage.Writer
 	metrics     *metrics.Registry
 	ready       atomic.Bool
@@ -47,7 +50,7 @@ func newEngine(ctx context.Context, cfg config.Config, logger *slog.Logger) (_ *
 	e := &engine{metrics: new(metrics.Registry), pipeDone: make(chan struct{}), writersDone: make(chan struct{}), logger: logger}
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, e.closeStores())
+			err = errors.Join(err, e.closeStorage())
 		}
 	}()
 	e.pipeline, err = ingest.New(ingest.Options{Capacity: cfg.Pipeline.Capacity, BatchSize: cfg.Pipeline.BatchSize, AdmissionTimeout: cfg.Pipeline.AdmissionTimeout, Router: router, Metrics: e.metrics, Logger: logger})
@@ -64,7 +67,31 @@ func newEngine(ctx context.Context, cfg config.Config, logger *slog.Logger) (_ *
 			return nil, err
 		}
 		e.stores = append(e.stores, store)
-		writer, err := storage.NewWriter(destination, store, storage.WriterOptions{Metrics: e.metrics, Logger: logger})
+	}
+	// Resolve actual file identities after creating the databases, so even a
+	// symlink or hard link cannot direct tail repair into a destination database.
+	if deadLetterInfo, statErr := os.Stat(cfg.Storage.DeadLetterPath); statErr == nil {
+		for _, destination := range []event.Destination{event.Service1, event.Service2, event.Service3} {
+			for _, suffix := range []string{".db", ".db-wal", ".db-shm"} {
+				info, statErr := os.Stat(filepath.Join(cfg.Storage.DataDir, "logs_"+string(destination)+suffix))
+				if errors.Is(statErr, os.ErrNotExist) {
+					continue
+				}
+				if statErr != nil {
+					return nil, statErr
+				}
+				if os.SameFile(deadLetterInfo, info) {
+					return nil, fmt.Errorf("DEAD_LETTER_PATH must not refer to destination database files")
+				}
+			}
+		}
+	}
+	e.deadLetters, err = storage.OpenDeadLetter(ctx, cfg.Storage.DeadLetterPath, storage.DeadLetterOptions{Logger: logger})
+	if err != nil {
+		return nil, err
+	}
+	for i, destination := range []event.Destination{event.Service1, event.Service2, event.Service3} {
+		writer, err := storage.NewWriter(destination, e.stores[i], storage.WriterOptions{Metrics: e.metrics, Logger: logger, DeadLetters: e.deadLetters})
 		if err != nil {
 			return nil, err
 		}
@@ -134,10 +161,25 @@ func (e *engine) drain(ctx context.Context) error {
 	return err
 }
 
-func (e *engine) closeStores() error {
+func (e *engine) healthy() bool {
+	if !e.ready.Load() {
+		return false
+	}
+	for _, writer := range e.writers {
+		if !writer.Healthy() {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *engine) closeStorage() error {
 	var err error
 	for _, store := range e.stores {
 		err = errors.Join(err, store.Close())
+	}
+	if e.deadLetters != nil {
+		err = errors.Join(err, e.deadLetters.Close())
 	}
 	return err
 }
